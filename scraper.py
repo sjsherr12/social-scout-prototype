@@ -79,10 +79,84 @@ def scrape_profile(username: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Followers list fetching via Apify
+# ---------------------------------------------------------------------------
+
+FOLLOWERS_ACTOR_ID = "datadoping/instagram-followers-scraper"
+
+
+def fetch_followers(username: str, fetch_count: int = 100000) -> list[str]:
+    """
+    Fetch followers of a public Instagram account via Apify.
+    fetch_count controls how many followers to request from the API.
+    Returns a list of follower usernames.
+    """
+    token = os.getenv("APIFY_API_TOKEN")
+    if not token:
+        raise RuntimeError("APIFY_API_TOKEN must be set in .env")
+
+    client = ApifyClient(token)
+
+    run_input = {
+        "usernames": [username],
+        "max_count": max(fetch_count, 50),
+    }
+
+    print(f"  Fetching followers for @{username} via Apify …")
+    run = client.actor(FOLLOWERS_ACTOR_ID).call(run_input=run_input, timeout_secs=300)
+
+    items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+
+    if not items:
+        raise ProfileNotFoundError(
+            f"No followers returned for @{username}. "
+            f"The profile may not exist, be private, or have no followers."
+        )
+
+    # Extract usernames from follower items
+    usernames = []
+    for item in items:
+        uname = item.get("username") or item.get("id") or item.get("login")
+        if uname:
+            usernames.append(uname)
+
+    return usernames
+
+
+# ---------------------------------------------------------------------------
+# 2c. Processed-username tracking for resumable scans
+# ---------------------------------------------------------------------------
+
+PROCESSED_DIR = "processed_logs"
+
+
+def _get_processed_path(target_username: str) -> str:
+    """Return the path to the processed-log file for a target account."""
+    return os.path.join(PROCESSED_DIR, f"processed_{target_username}.txt")
+
+
+def load_processed(target_username: str) -> set[str]:
+    """Load the set of already-processed follower usernames for a target account."""
+    path = _get_processed_path(target_username)
+    if not os.path.exists(path):
+        return set()
+    with open(path, "r", encoding="utf-8") as f:
+        return set(line.strip() for line in f if line.strip())
+
+
+def mark_processed(target_username: str, follower_username: str):
+    """Append a follower username to the processed-log file."""
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    path = _get_processed_path(target_username)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(follower_username + "\n")
+
+
+# ---------------------------------------------------------------------------
 # 3. Engagement metrics (calculated from Apify's recent posts data)
 # ---------------------------------------------------------------------------
 
-MAX_POSTS = 12  # use up to 12 recent posts for engagement calculation
+MAX_POSTS = 8  # use up to 8 recent posts for engagement calculation
 
 
 def calculate_engagement(raw_apify_data: dict, followers: int) -> dict:
@@ -122,11 +196,9 @@ def calculate_engagement(raw_apify_data: dict, followers: int) -> dict:
 # ---------------------------------------------------------------------------
 
 VISION_PROMPT = (
-    "Analyze this Instagram profile picture. Return a JSON object with exactly "
+    "Analyze this Instagram profile picture of a woman. Return a JSON object with exactly "
     "these fields:\n"
-    '  "gender": (string — "male", "female", or "unknown"),\n'
-    '  "age_min": (int — estimated minimum age),\n'
-    '  "age_max": (int — estimated maximum age),\n'
+    '  "estimated_age": (int — single best-guess estimated age, must be 18+),\n'
     '  "ethnicity": (string — "white", "black", "asian"). Note that "white" includes Hispanics, Europeans, etc.,\n'
     '  "hair_color": (string — e.g. "black", "blonde", "brown", "red", "gray", "unknown"),\n'
     '  "attractiveness_rating": (float 0.0 to 1.0 — overall facial attractiveness, '
@@ -136,8 +208,6 @@ VISION_PROMPT = (
     'Reserve 0.9+ for exceptionally attractive individuals. '
     'Be critical and realistic — rate from the perspective of a young man.\n'
     "\n"
-    "If the image does not clearly show a person (e.g. a logo, pet, or group photo), "
-    'set all fields to "unknown" (use 0 for age ints, and null for attractiveness_rating).\n'
     "Return ONLY valid JSON, no explanation."
 )
 
@@ -197,8 +267,7 @@ def analyze_profile_pic(profile_pic_url: str) -> dict:
         result = json.loads(raw)
 
         return {
-            "age_min": result.get("age_min"),
-            "age_max": result.get("age_max"),
+            "estimated_age": result.get("estimated_age"),
             "ethnicity": result.get("ethnicity"),
             "hair_color": result.get("hair_color"),
             "attractiveness_rating": result.get("attractiveness_rating"),
@@ -211,12 +280,197 @@ def analyze_profile_pic(profile_pic_url: str) -> dict:
 
 def _empty_vision_result() -> dict:
     return {
-        "age_min": None,
-        "age_max": None,
+        "estimated_age": None,
         "ethnicity": None,
         "hair_color": None,
         "attractiveness_rating": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# 4b. Username precheck via Grok (text-only, no image)
+# ---------------------------------------------------------------------------
+
+USERNAME_PRECHECK_PROMPT = (
+    "You are analyzing an Instagram username to determine if it belongs to a real person "
+    "or a business/organization/brand.\n\n"
+    "Username: \"{username}\"\n\n"
+    "Return a JSON object with exactly one field:\n"
+    '  "is_personal": (boolean — true if this username likely belongs to a real person, '
+    "false if it sounds like a business, organization, brand, group, store, agency, "
+    "clinic, team, media outlet, etc.)\n\n"
+    "Important: Many real people use underscores, dots, numbers, and abbreviations in "
+    "their usernames. A username like 'jessica_m.02' or 'j.smith_97' is clearly personal. "
+    "Only flag usernames that sound distinctly organizational or commercial "
+    '(e.g. "alliancepsychologygroup", "downtowndentalcare", "thefitnessstudiola").\n'
+    "When in doubt, lean toward is_personal: true.\n\n"
+    "Return ONLY valid JSON, no explanation."
+)
+
+
+def precheck_username(username: str) -> bool:
+    """
+    Lightweight text-only check — determines if a username sounds like
+    a real person or a business/organization.
+    Returns True if likely personal, False if likely business.
+    """
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        print("  ⚠ No XAI_API_KEY found — skipping username precheck.")
+        return True  # default to allowing through
+
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.x.ai/v1",
+        )
+
+        prompt = USERNAME_PRECHECK_PROMPT.replace("{username}", username)
+
+        response = client.chat.completions.create(
+            model="grok-4.20-0309-non-reasoning",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=50,
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+        result = json.loads(raw)
+        return result.get("is_personal", True)
+
+    except Exception as e:
+        print(f"  ⚠ Username precheck failed: {e}")
+        return True  # default to allowing through
+
+
+# ---------------------------------------------------------------------------
+# 4c. Lightweight vision precheck for follower qualification
+# ---------------------------------------------------------------------------
+
+PRECHECK_VISION_PROMPT = (
+    "Analyze this Instagram profile picture. Return a JSON object with exactly "
+    "these fields:\n"
+    '  "visible_person": (boolean — true if the image clearly shows a person\'s face or body),\n'
+    '  "gender": (string — "male", "female", or "unknown"),\n'
+    '  "estimated_age": (int — best-guess age, or 0 if no person visible)\n'
+    "\n"
+    "If the image does not clearly show a single person (e.g. logo, pet, "
+    'object, default avatar, symbol), set visible_person to false.\n'
+    "Return ONLY valid JSON, no explanation."
+)
+
+
+def precheck_profile_pic(profile_pic_url: str) -> dict:
+    """
+    Lightweight vision check — only determines visible_person, gender,
+    and estimated_age to qualify/disqualify a follower before full analysis.
+    """
+    default = {"visible_person": False, "gender": "unknown", "estimated_age": 0}
+
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        print("  ⚠ No XAI_API_KEY found — skipping vision precheck.")
+        return default
+
+    try:
+        resp = req.get(profile_pic_url, timeout=15)
+        resp.raise_for_status()
+        image_bytes = resp.content
+    except req.RequestException as e:
+        print(f"  ⚠ Failed to download profile picture: {e}")
+        return default
+
+    try:
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.x.ai/v1",
+        )
+
+        response = client.chat.completions.create(
+            model="grok-4.20-0309-non-reasoning",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": PRECHECK_VISION_PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_image}",
+                                "detail": "low",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=100,
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+        result = json.loads(raw)
+
+        return {
+            "visible_person": result.get("visible_person", False),
+            "gender": result.get("gender", "unknown"),
+            "estimated_age": result.get("estimated_age", 0),
+        }
+
+    except Exception as e:
+        print(f"  ⚠ Vision precheck failed: {e}")
+        return default
+
+
+# ---------------------------------------------------------------------------
+# 4c. Follower qualification checks
+# ---------------------------------------------------------------------------
+
+def qualify_follower_basic(profile_data: dict, raw_apify_data: dict) -> tuple:
+    """
+    Run free qualification checks (no API calls needed).
+    Returns (passed: bool, reason: str).
+    """
+    followers = profile_data.get("followers", 0)
+    if followers < 100:
+        return False, f"too few followers ({followers})"
+    if followers > 10000:
+        return False, f"too many followers ({followers})"
+
+    if raw_apify_data.get("isBusinessAccount", False):
+        return False, "business account"
+    if raw_apify_data.get("isProfessionalAccount", False):
+        return False, "professional/creator account"
+
+    return True, ""
+
+
+def qualify_follower_vision(precheck_result: dict) -> tuple:
+    """
+    Run vision-based qualification checks using precheck results.
+    Returns (passed: bool, reason: str).
+    """
+    if not precheck_result.get("visible_person", False):
+        return False, "no visible person in profile picture"
+
+    gender = precheck_result.get("gender", "unknown")
+    if gender != "female":
+        return False, f"gender is {gender}, not female"
+
+    age = precheck_result.get("estimated_age", 0)
+    if age < 18 or age > 36:
+        return False, f"estimated age {age} outside 18-36 range"
+
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
