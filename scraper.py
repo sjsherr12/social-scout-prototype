@@ -212,7 +212,7 @@ VISION_PROMPT = (
     "    0.80–0.90: strikingly beautiful — model-tier\n"
     "    0.90–1.00: exceptionally rare, top-tier beauty\n"
     "  Be harsh and discriminating. DO NOT default to the 0.6–0.8 range for everyone. "
-    "Most women should score between 0.3 and 0.6. "
+    "Use the full range of scores to give specific values. "
     "Carefully evaluate facial symmetry, bone structure, skin clarity, eye shape, "
     "lip fullness, hair quality, body appeal, and overall harmony of features. "
     "Rate from the perspective of a young man.)\n"
