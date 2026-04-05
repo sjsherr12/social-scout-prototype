@@ -201,12 +201,21 @@ VISION_PROMPT = (
     '  "estimated_age": (int — single best-guess estimated age, must be 18+),\n'
     '  "ethnicity": (string — "white", "black", "asian"). Note that "white" includes Hispanics, Europeans, etc.,\n'
     '  "hair_color": (string — e.g. "black", "blonde", "brown", "red", "gray", "unknown"),\n'
-    '  "attractiveness_rating": (float 0.0 to 1.0 — overall facial attractiveness, '
-    '0.0 being lowest and 1.0 being highest. Use the FULL range of the scale. '
-    'An average-looking girl should score around 0.5. '
-    'Only genuinely attractive women should score above 0.8. '
-    'Reserve 0.9+ for exceptionally attractive individuals. '
-    'Be critical and realistic — rate from the perspective of a young man.\n'
+    '  "attractiveness_rating": (float 0.0 to 1.0 — overall attractiveness scored '
+    "on a roughly normal distribution. Follow this calibration strictly:\n"
+    "    0.00–0.15: very unattractive (bottom ~5%)\n"
+    "    0.15–0.30: below average\n"
+    "    0.30–0.45: slightly below average\n"
+    "    0.45–0.55: average — most people cluster here\n"
+    "    0.55–0.70: above average, noticeably attractive\n"
+    "    0.70–0.80: very attractive — would stand out in a crowd\n"
+    "    0.80–0.90: strikingly beautiful — model-tier\n"
+    "    0.90–1.00: exceptionally rare, top-tier beauty\n"
+    "  Be harsh and discriminating. DO NOT default to the 0.6–0.8 range for everyone. "
+    "Most women should score between 0.3 and 0.6. "
+    "Carefully evaluate facial symmetry, bone structure, skin clarity, eye shape, "
+    "lip fullness, hair quality, body appeal, and overall harmony of features. "
+    "Rate from the perspective of a young man.)\n"
     "\n"
     "Return ONLY valid JSON, no explanation."
 )
@@ -248,7 +257,7 @@ def analyze_profile_pic(profile_pic_url: str) -> dict:
                             "type": "image_url",
                             "image_url": {
                                 "url": f"data:image/jpeg;base64,{b64_image}",
-                                "detail": "low",
+                                "detail": "high",
                             },
                         },
                     ],
