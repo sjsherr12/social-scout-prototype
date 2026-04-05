@@ -117,6 +117,14 @@ def process_single_follower(target_username: str, username: str, stats: dict,
     # Full vision analysis (ethnicity, hair, attractiveness + estimated_age)
     vision_data = analyze_profile_pic(pic_url)
 
+    # Re-check age from full analysis (can differ from precheck estimate)
+    full_age = vision_data.get("estimated_age")
+    if full_age is not None and (full_age < 18 or full_age > 36):
+        print(f"    SKIP: full analysis estimated age {full_age} outside 18-36 range")
+        stats["disqualified"] += 1
+        mark_processed(target_username, username)
+        return
+
     # Merge and save
     merged = {**profile_data, **engagement_data, **vision_data}
     if location_data:
