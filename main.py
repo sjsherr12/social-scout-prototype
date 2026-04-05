@@ -49,13 +49,15 @@ from scraper import (
     precheck_profile_pic,
     qualify_follower_basic,
     qualify_follower_vision,
+    upload_profile_pic,
+    get_instagram_pic_url,
     ProfileNotFoundError,
 )
 
 # Fields that come from Apify scraping
 APIFY_FIELDS = {
     "username", "profile_url", "name", "followers", "following",
-    "bio", "profile_image_url", "is_private", "post_count",
+    "bio", "is_private", "post_count",
 }
 
 # Fields that require engagement calculation (always grouped together)
@@ -88,7 +90,7 @@ def process_single_follower(target_username: str, username: str, stats: dict,
         return
 
     # Step 3: Vision precheck (lightweight — visible person, gender, age)
-    pic_url = profile_data.get("profile_image_url")
+    pic_url = get_instagram_pic_url(raw_apify_data)
     if not pic_url:
         print("    SKIP: no profile picture available")
         stats["disqualified"] += 1
@@ -124,6 +126,9 @@ def process_single_follower(target_username: str, username: str, stats: dict,
         stats["disqualified"] += 1
         mark_processed(target_username, username)
         return
+
+    # Upload profile picture to Supabase Storage
+    upload_profile_pic(username, pic_url)
 
     # Merge and save
     merged = {**profile_data, **engagement_data, **vision_data}
@@ -325,9 +330,9 @@ def main():
 
     # Step 3: Analyze profile picture with Grok vision
     vision_data = {}
+    pic_url = get_instagram_pic_url(raw_apify_data)
     if run_vision:
         print("[3/4] Analyzing profile picture …")
-        pic_url = profile_data.get("profile_image_url") or raw_apify_data.get("profilePicUrlHD") or raw_apify_data.get("profilePicUrl")
         if pic_url:
             vision_data = analyze_profile_pic(pic_url)
             if vision_data.get("estimated_age") is not None:
@@ -341,6 +346,10 @@ def main():
             print("  ⚠ No profile picture URL available")
     else:
         print("[3/4] Skipping vision analysis.")
+
+    # Upload profile picture to Supabase Storage
+    if pic_url:
+        upload_profile_pic(username, pic_url)
 
     # Step 4: Write to Supabase
     print("[4/4] Writing to Supabase …")

@@ -70,7 +70,6 @@ def scrape_profile(username: str) -> dict:
         "followers": followers,
         "following": raw.get("followsCount", 0),
         "bio": raw.get("biography"),
-        "profile_image_url": raw.get("profilePicUrlHD") or raw.get("profilePicUrl"),
         "is_private": raw.get("private", False),
         "post_count": post_count,
     }
@@ -483,7 +482,57 @@ def qualify_follower_vision(precheck_result: dict) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# 5. Supabase write
+# 5. Profile picture storage (Supabase Storage)
+# ---------------------------------------------------------------------------
+
+STORAGE_BUCKET = "profile-pics"
+
+
+def get_instagram_pic_url(raw_apify_data: dict) -> str | None:
+    """Extract the best profile picture URL from raw Apify data."""
+    return raw_apify_data.get("profilePicUrlHD") or raw_apify_data.get("profilePicUrl")
+
+
+def upload_profile_pic(username: str, profile_pic_url: str):
+    """Download profile picture from Instagram and upload to Supabase Storage."""
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+    if not url or not key:
+        print("  ⚠ SUPABASE_URL / SUPABASE_KEY not set — skipping pic upload.")
+        return
+
+    # Download image from Instagram
+    try:
+        resp = req.get(profile_pic_url, timeout=15)
+        resp.raise_for_status()
+        image_bytes = resp.content
+    except req.RequestException as e:
+        print(f"  ⚠ Failed to download profile picture for upload: {e}")
+        return
+
+    # Upload to Supabase Storage (overwrite if exists)
+    try:
+        supabase = create_client(url, key)
+        file_path = f"{username}.jpg"
+
+        supabase.storage.from_(STORAGE_BUCKET).upload(
+            path=file_path,
+            file=image_bytes,
+            file_options={"content-type": "image/jpeg", "upsert": "true"},
+        )
+        print(f"  ✓ Profile pic uploaded to storage: {file_path}")
+    except Exception as e:
+        print(f"  ⚠ Storage upload failed: {e}")
+
+
+def get_storage_pic_url(username: str) -> str:
+    """Construct the public Supabase Storage URL for a profile picture."""
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    return f"{supabase_url}/storage/v1/object/public/{STORAGE_BUCKET}/{username}.jpg"
+
+
+# ---------------------------------------------------------------------------
+# 6. Supabase write
 # ---------------------------------------------------------------------------
 
 def write_to_supabase(data: dict):
