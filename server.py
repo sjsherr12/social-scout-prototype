@@ -30,6 +30,7 @@ from scraper import (
     load_processed,
     mark_processed,
     precheck_username,
+    precheck_bio,
     precheck_profile_pic,
     qualify_follower_basic,
     qualify_follower_vision,
@@ -294,6 +295,27 @@ def _process_single_follower_for_scan(
         stats["disqualified"] += 1
         mark_processed(target_username, username)
         return
+
+    # Step 2b: Bio precheck
+    bio = profile_data.get("bio") or ""
+    if bio.strip():
+        q.put({"event": "follower_step", "username": username, "step": "Bio precheck"})
+        bio_check = precheck_bio(bio)
+        if bio_check.get("is_parent") or bio_check.get("in_relationship") or bio_check.get("too_old") or bio_check.get("other_disqualifier"):
+            reasons = []
+            if bio_check.get("is_parent"):
+                reasons.append("parent")
+            if bio_check.get("in_relationship"):
+                reasons.append("in relationship")
+            if bio_check.get("too_old"):
+                reasons.append("too old")
+            if bio_check.get("other_disqualifier"):
+                reasons.append("other disqualifier")
+            reason_str = ", ".join(reasons)
+            q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": f"bio signals: {reason_str}"})
+            stats["disqualified"] += 1
+            mark_processed(target_username, username)
+            return
 
     # Step 3: Vision precheck
     pic_url = get_instagram_pic_url(raw_apify_data)

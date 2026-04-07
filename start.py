@@ -22,7 +22,7 @@ def main():
     # Check node_modules exist
     if not os.path.isdir(os.path.join(FRONTEND, "node_modules")):
         print("Installing frontend dependencies...")
-        subprocess.run(["npm", "install"], cwd=FRONTEND, shell=True, check=True)
+        subprocess.run(["npm", "install"], cwd=FRONTEND, check=True)
 
     print("\n" + "=" * 50)
     print("  Social Scout")
@@ -45,7 +45,6 @@ def main():
         frontend = subprocess.Popen(
             ["npm", "run", "dev"],
             cwd=FRONTEND,
-            shell=True,
         )
         procs.append(frontend)
 

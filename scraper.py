@@ -356,7 +356,89 @@ def precheck_username(username: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 4c. Lightweight vision precheck for follower qualification
+# 4c. Bio precheck via Grok (text-only, no image)
+# ---------------------------------------------------------------------------
+
+BIO_PRECHECK_PROMPT = (
+    "You are analyzing an Instagram bio to determine if the person shows any signs "
+    "that would make them ineligible for a romantic partnership.\n\n"
+    "Bio: \"{bio}\"\n\n"
+    "Return a JSON object with exactly these fields:\n"
+    '  "is_parent": (boolean — true if the bio indicates they are a parent, '
+    'e.g. mentions kids, "mom", "mama", "mother", child ages, etc.),\n'
+    '  "in_relationship": (boolean — true if the bio indicates they are in a '
+    'relationship, e.g. mentions husband, wife, boyfriend, girlfriend, partner, '
+    '"taken", "wifey", wedding date, couple references, etc.),\n'
+    '  "too_old": (boolean — true if the bio contains signals suggesting they are '
+    "significantly older than mid-30s, e.g. mentions grandchildren, retirement, "
+    "class of '85, etc.),\n"
+    '  "other_disqualifier": (boolean — true if there are any other clear signals '
+    "that would make them ineligible for a romantic partnership, e.g. memorial "
+    "account, business-only account, explicitly not looking for dating, etc.)\n\n"
+    "Important: Only flag signals that are clearly present in the bio text. "
+    "If the bio is empty, ambiguous, or has no disqualifying signals, all fields "
+    "should be false.\n\n"
+    "Return ONLY valid JSON, no explanation."
+)
+
+
+def precheck_bio(bio: str) -> dict:
+    """
+    Lightweight text-only check — determines if a user's bio contains
+    signals that would disqualify them (parent, in relationship, too old, etc.).
+    Returns a dict with boolean fields for each disqualifier.
+    """
+    default = {
+        "is_parent": False,
+        "in_relationship": False,
+        "too_old": False,
+        "other_disqualifier": False,
+    }
+
+    if not bio or not bio.strip():
+        return default
+
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        print("  ⚠ No XAI_API_KEY found — skipping bio precheck.")
+        return default
+
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.x.ai/v1",
+        )
+
+        prompt = BIO_PRECHECK_PROMPT.replace("{bio}", bio)
+
+        response = client.chat.completions.create(
+            model="grok-4.20-0309-non-reasoning",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100,
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+        result = json.loads(raw)
+
+        return {
+            "is_parent": result.get("is_parent", False),
+            "in_relationship": result.get("in_relationship", False),
+            "too_old": result.get("too_old", False),
+            "other_disqualifier": result.get("other_disqualifier", False),
+        }
+
+    except Exception as e:
+        print(f"  ⚠ Bio precheck failed: {e}")
+        return default
+
+
+# ---------------------------------------------------------------------------
+# 4d. Lightweight vision precheck for follower qualification
 # ---------------------------------------------------------------------------
 
 PRECHECK_VISION_PROMPT = (
@@ -440,7 +522,7 @@ def precheck_profile_pic(profile_pic_url: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 4c. Follower qualification checks
+# 4e. Follower qualification checks
 # ---------------------------------------------------------------------------
 
 def qualify_follower_basic(profile_data: dict, raw_apify_data: dict) -> tuple:
