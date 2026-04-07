@@ -110,7 +110,7 @@ def scrape_single(req: ScrapeRequest):
 
     # Filter fields if --only
     apify_fields = {
-        "username", "profile_url", "name", "followers", "following",
+        "username", "name", "followers", "following",
         "bio", "is_private", "post_count",
     }
     if only_fields:

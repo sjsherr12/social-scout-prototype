@@ -2,7 +2,7 @@
 
 export interface Profile {
   username: string;
-  profile_url?: string;
+
   name?: string;
   followers?: number;
   following?: number;

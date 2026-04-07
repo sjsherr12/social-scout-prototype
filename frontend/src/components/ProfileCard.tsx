@@ -70,16 +70,14 @@ export default function ProfileCard({ profile }: { profile: Profile }) {
               {profile.bio}
             </p>
           )}
-          {profile.profile_url && (
-            <a
-              href={profile.profile_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-400 text-xs hover:underline mt-1 inline-block"
-            >
-              View on Instagram
-            </a>
-          )}
+          <a
+            href={`https://www.instagram.com/${profile.username}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-400 text-xs hover:underline mt-1 inline-block"
+          >
+            View on Instagram
+          </a>
         </div>
       </div>
 

@@ -56,7 +56,7 @@ from scraper import (
 
 # Fields that come from Apify scraping
 APIFY_FIELDS = {
-    "username", "profile_url", "name", "followers", "following",
+    "username", "name", "followers", "following",
     "bio", "is_private", "post_count",
 }
 

@@ -65,7 +65,6 @@ def scrape_profile(username: str) -> dict:
 
     data = {
         "username": raw.get("username", username),
-        "profile_url": f"https://www.instagram.com/{raw.get('username', username)}",
         "name": raw.get("fullName"),
         "followers": followers,
         "following": raw.get("followsCount", 0),
@@ -444,12 +443,26 @@ def precheck_bio(bio: str) -> dict:
 PRECHECK_VISION_PROMPT = (
     "Analyze this Instagram profile picture. Return a JSON object with exactly "
     "these fields:\n"
-    '  "visible_person": (boolean — true if the image clearly shows a person\'s face or body),\n'
+    '  "visible_person": (boolean — true ONLY if the image clearly shows exactly ONE woman\'s face or body, with no other people present),\n'
     '  "gender": (string — "male", "female", or "unknown"),\n'
-    '  "estimated_age": (int — best-guess age, or 0 if no person visible)\n'
+    '  "estimated_age": (int — best-guess age, or 0 if no person visible),\n'
+    '  "disqualify_reason": (string or null — reason the person should be disqualified, or null if none)\n'
     "\n"
-    "If the image does not clearly show a single person (e.g. logo, pet, "
-    'object, default avatar, symbol), set visible_person to false.\n'
+    "Set visible_person to false if:\n"
+    "  - The image does not clearly show a single person (e.g. logo, pet, object, default avatar, symbol)\n"
+    "  - There are multiple people in the image (e.g. a couple, group photo, woman with a man)\n"
+    "  - There is a child, baby, or infant in the image (likely a parent)\n"
+    "\n"
+    "Set disqualify_reason to a short description if you detect any of these red flags:\n"
+    '  - Woman pictured with a man (e.g. "woman with man, likely in relationship")\n'
+    '  - Child or baby present (e.g. "child in photo, likely a parent")\n'
+    '  - Multiple people in photo (e.g. "group photo, not a solo picture")\n'
+    '  - Wedding ring or wedding attire visible (e.g. "wedding imagery, likely married")\n'
+    '  - Any other signal suggesting the person is in a relationship, is a parent, or is outside the 20-32 age range\n'
+    "  - If none of these apply, set disqualify_reason to null\n"
+    "\n"
+    "The ideal profile picture is one clear photo of a single young woman (face or body). "
+    "Anything else should be flagged.\n"
     "Return ONLY valid JSON, no explanation."
 )
 
@@ -459,7 +472,7 @@ def precheck_profile_pic(profile_pic_url: str) -> dict:
     Lightweight vision check — only determines visible_person, gender,
     and estimated_age to qualify/disqualify a follower before full analysis.
     """
-    default = {"visible_person": False, "gender": "unknown", "estimated_age": 0}
+    default = {"visible_person": False, "gender": "unknown", "estimated_age": 0, "disqualify_reason": None}
 
     api_key = os.getenv("XAI_API_KEY")
     if not api_key:
@@ -493,7 +506,7 @@ def precheck_profile_pic(profile_pic_url: str) -> dict:
                             "type": "image_url",
                             "image_url": {
                                 "url": f"data:image/jpeg;base64,{b64_image}",
-                                "detail": "low",
+                                "detail": "high",
                             },
                         },
                     ],
@@ -514,6 +527,7 @@ def precheck_profile_pic(profile_pic_url: str) -> dict:
             "visible_person": result.get("visible_person", False),
             "gender": result.get("gender", "unknown"),
             "estimated_age": result.get("estimated_age", 0),
+            "disqualify_reason": result.get("disqualify_reason"),
         }
 
     except Exception as e:
@@ -531,9 +545,9 @@ def qualify_follower_basic(profile_data: dict, raw_apify_data: dict) -> tuple:
     Returns (passed: bool, reason: str).
     """
     followers = profile_data.get("followers", 0)
-    if followers < 100:
+    if followers < 200:
         return False, f"too few followers ({followers})"
-    if followers > 10000:
+    if followers > 20000:
         return False, f"too many followers ({followers})"
 
     if raw_apify_data.get("isBusinessAccount", False):
@@ -557,8 +571,12 @@ def qualify_follower_vision(precheck_result: dict) -> tuple:
         return False, f"gender is {gender}, not female"
 
     age = precheck_result.get("estimated_age", 0)
-    if age < 18 or age > 36:
-        return False, f"estimated age {age} outside 18-36 range"
+    if age < 20 or age > 32:
+        return False, f"estimated age {age} outside 20-32 range"
+
+    disqualify_reason = precheck_result.get("disqualify_reason")
+    if disqualify_reason:
+        return False, f"vision disqualified: {disqualify_reason}"
 
     return True, ""
 

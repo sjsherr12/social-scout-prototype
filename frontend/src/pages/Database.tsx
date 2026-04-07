@@ -62,16 +62,14 @@ function ProfileRow({ profile }: { profile: Profile }) {
               <span className="text-sm font-medium text-white truncate">
                 @{profile.username}
               </span>
-              {profile.profile_url && (
-                <a
-                  href={profile.profile_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-zinc-600 hover:text-zinc-400 transition-colors"
-                >
-                  <ExternalLink size={12} />
-                </a>
-              )}
+              <a
+                href={`https://www.instagram.com/${profile.username}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-zinc-600 hover:text-zinc-400 transition-colors"
+              >
+                <ExternalLink size={12} />
+              </a>
             </div>
             {profile.name && (
               <p className="text-xs text-zinc-500 truncate">{profile.name}</p>
