@@ -154,7 +154,7 @@ def mark_processed(target_username: str, follower_username: str):
 # 3. Engagement metrics (calculated from Apify's recent posts data)
 # ---------------------------------------------------------------------------
 
-MAX_POSTS = 8  # use up to 8 recent posts for engagement calculation
+MAX_POSTS = 3  # use up to 3 recent posts for engagement calculation
 
 
 def calculate_engagement(raw_apify_data: dict, followers: int) -> dict:
@@ -443,26 +443,30 @@ def precheck_bio(bio: str) -> dict:
 PRECHECK_VISION_PROMPT = (
     "Analyze this Instagram profile picture. Return a JSON object with exactly "
     "these fields:\n"
-    '  "visible_person": (boolean — true ONLY if the image clearly shows exactly ONE woman\'s face or body, with no other people present),\n'
+    '  "visible_person": (boolean — true ONLY if the image clearly shows a woman\'s face or body),\n'
     '  "gender": (string — "male", "female", or "unknown"),\n'
     '  "estimated_age": (int — best-guess age, or 0 if no person visible),\n'
     '  "disqualify_reason": (string or null — reason the person should be disqualified, or null if none)\n'
     "\n"
     "Set visible_person to false if:\n"
-    "  - The image does not clearly show a single person (e.g. logo, pet, object, default avatar, symbol)\n"
-    "  - There are multiple people in the image (e.g. a couple, group photo, woman with a man)\n"
+    "  - The image does not very clearly and visibly show a woman\'s face or body (e.g. logo, pet, object, default avatar, symbol)\n"
     "  - There is a child, baby, or infant in the image (likely a parent)\n"
+    "  - There is a man or male in the image (likely in a relationship)\n"
+    "\n"
+    "Set visible_person to true if:\n"
+    "  - There is one clear woman, even if she is pictured with friends (only female)\n"
+    "  - The photo is a group of girlfriends and one woman is clearly the main subject\n"
     "\n"
     "Set disqualify_reason to a short description if you detect any of these red flags:\n"
-    '  - Woman pictured with a man (e.g. "woman with man, likely in relationship")\n'
+    '  - Woman pictured intimately with a man (e.g. couple pose, arms around each other — "likely in relationship")\n'
     '  - Child or baby present (e.g. "child in photo, likely a parent")\n'
-    '  - Multiple people in photo (e.g. "group photo, not a solo picture")\n'
     '  - Wedding ring or wedding attire visible (e.g. "wedding imagery, likely married")\n'
     '  - Any other signal suggesting the person is in a relationship, is a parent, or is outside the 20-32 age range\n'
     "  - If none of these apply, set disqualify_reason to null\n"
+    "  - Do NOT disqualify just because friends are in the photo\n"
     "\n"
-    "The ideal profile picture is one clear photo of a single young woman (face or body). "
-    "Anything else should be flagged.\n"
+    "The ideal profile picture clearly features a young woman (face or body). "
+    "She may have friends in the photo — that is fine as long as she is clearly the main subject.\n"
     "Return ONLY valid JSON, no explanation."
 )
 
@@ -545,10 +549,16 @@ def qualify_follower_basic(profile_data: dict, raw_apify_data: dict) -> tuple:
     Returns (passed: bool, reason: str).
     """
     followers = profile_data.get("followers", 0)
-    if followers < 200:
+    if followers < 350:
         return False, f"too few followers ({followers})"
     if followers > 20000:
         return False, f"too many followers ({followers})"
+
+    posts = profile_data.get("post_count", 0)
+    if posts < 1:
+        return False, "no posts"
+    if posts > 200:
+        return False, f"too many posts ({posts})"
 
     if raw_apify_data.get("isBusinessAccount", False):
         return False, "business account"
