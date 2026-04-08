@@ -8,6 +8,7 @@ import sys
 import os
 import signal
 
+WINDOWS = sys.platform == "win32"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = os.path.join(ROOT, "frontend")
 
@@ -22,7 +23,7 @@ def main():
     # Check node_modules exist
     if not os.path.isdir(os.path.join(FRONTEND, "node_modules")):
         print("Installing frontend dependencies...")
-        subprocess.run(["npm", "install"], cwd=FRONTEND, check=True, shell=True)
+        subprocess.run(["npm", "install"], cwd=FRONTEND, check=True, shell=WINDOWS)
 
     print("\n" + "=" * 50)
     print("  Social Scout")
@@ -45,7 +46,7 @@ def main():
         frontend = subprocess.Popen(
             ["npm", "run", "dev"],
             cwd=FRONTEND,
-            shell=True,
+            shell=WINDOWS,
         )
         procs.append(frontend)
 
