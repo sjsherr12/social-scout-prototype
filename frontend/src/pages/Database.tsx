@@ -18,6 +18,7 @@ const SORT_OPTIONS = [
   { value: "attractiveness_rating", label: "Attractiveness" },
   { value: "followers", label: "Followers" },
   { value: "engagement_rate", label: "Engagement Rate" },
+  { value: "follower_ratio", label: "Ratio" },
   { value: "estimated_age", label: "Age" },
 ];
 
@@ -85,6 +86,12 @@ function ProfileRow({ profile }: { profile: Profile }) {
       <td className="py-3 px-3 text-sm text-zinc-300 text-right">
         {profile.engagement_rate !== null && profile.engagement_rate !== undefined
           ? `${profile.engagement_rate}%`
+          : "-"}
+      </td>
+      {/* Ratio */}
+      <td className="py-3 px-3 text-sm text-zinc-300 text-right">
+        {profile.follower_ratio !== null && profile.follower_ratio !== undefined
+          ? profile.follower_ratio.toFixed(2)
           : "-"}
       </td>
       {/* Age */}
@@ -240,6 +247,7 @@ export default function Database() {
                       { key: "username", label: "Profile", align: "text-left" },
                       { key: "followers", label: "Followers", align: "text-right" },
                       { key: "engagement_rate", label: "Engagement", align: "text-right" },
+                      { key: "follower_ratio", label: "Ratio", align: "text-right" },
                       { key: "estimated_age", label: "Age", align: "text-center" },
                       { key: "ethnicity", label: "Ethnicity", align: "text-center" },
                       { key: "attractiveness_rating", label: "Rating", align: "text-right" },
@@ -267,7 +275,7 @@ export default function Database() {
                   {data.data.length === 0 ? (
                     <tr>
                       <td
-                        colSpan={8}
+                        colSpan={9}
                         className="py-12 text-center text-zinc-600 text-sm"
                       >
                         No profiles found.

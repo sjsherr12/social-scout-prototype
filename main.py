@@ -89,6 +89,24 @@ def process_single_follower(target_username: str, username: str, stats: dict,
         mark_processed(target_username, username)
         return
 
+    # Step 2b: Follower ratio precheck
+    follower_ratio = profile_data.get("follower_ratio")
+    if follower_ratio is not None and follower_ratio < 1:
+        print(f"    SKIP: follower ratio too low ({follower_ratio})")
+        stats["disqualified"] += 1
+        mark_processed(target_username, username)
+        return
+
+    # Step 2c: Engagement rate precheck (only for non-private accounts)
+    if not profile_data.get("is_private", False):
+        eng = calculate_engagement(raw_apify_data, profile_data.get("followers", 0))
+        eng_rate = eng.get("engagement_rate")
+        if eng_rate is not None and eng_rate < 5:
+            print(f"    SKIP: engagement rate too low ({eng_rate}%)")
+            stats["disqualified"] += 1
+            mark_processed(target_username, username)
+            return
+
     # Step 3: Vision precheck (lightweight — visible person, gender, age)
     pic_url = get_instagram_pic_url(raw_apify_data)
     if not pic_url:

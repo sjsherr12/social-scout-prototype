@@ -296,7 +296,25 @@ def _process_single_follower_for_scan(
         mark_processed(target_username, username)
         return
 
-    # Step 2b: Bio precheck
+    # Step 2b: Follower ratio precheck
+    follower_ratio = profile_data.get("follower_ratio")
+    if follower_ratio is not None and follower_ratio < 1:
+        q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": f"follower ratio too low ({follower_ratio})"})
+        stats["disqualified"] += 1
+        mark_processed(target_username, username)
+        return
+
+    # Step 2c: Engagement rate precheck (only for non-private accounts)
+    if not profile_data.get("is_private", False):
+        eng = calculate_engagement(raw_apify_data, profile_data.get("followers", 0))
+        eng_rate = eng.get("engagement_rate")
+        if eng_rate is not None and eng_rate < 5:
+            q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": f"engagement rate too low ({eng_rate}%)"})
+            stats["disqualified"] += 1
+            mark_processed(target_username, username)
+            return
+
+    # Step 2c: Bio precheck
     bio = profile_data.get("bio") or ""
     if bio.strip():
         q.put({"event": "follower_step", "username": username, "step": "Bio precheck"})

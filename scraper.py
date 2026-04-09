@@ -61,16 +61,19 @@ def scrape_profile(username: str) -> dict:
 
     # Map Apify fields to our schema
     followers = raw.get("followersCount", 0)
+    following = raw.get("followsCount", 0)
     post_count = raw.get("postsCount", 0)
+    follower_ratio = round(followers / following, 4) if following else None
 
     data = {
         "username": raw.get("username", username),
         "name": raw.get("fullName"),
         "followers": followers,
-        "following": raw.get("followsCount", 0),
+        "following": following,
         "bio": raw.get("biography"),
         "is_private": raw.get("private", False),
         "post_count": post_count,
+        "follower_ratio": follower_ratio,
     }
 
     return data, raw
@@ -154,7 +157,7 @@ def mark_processed(target_username: str, follower_username: str):
 # 3. Engagement metrics (calculated from Apify's recent posts data)
 # ---------------------------------------------------------------------------
 
-MAX_POSTS = 3  # use up to 3 recent posts for engagement calculation
+MAX_POSTS = 5  # use up to 5 recent posts for engagement calculation
 
 
 def calculate_engagement(raw_apify_data: dict, followers: int) -> dict:
@@ -549,9 +552,9 @@ def qualify_follower_basic(profile_data: dict, raw_apify_data: dict) -> tuple:
     Returns (passed: bool, reason: str).
     """
     followers = profile_data.get("followers", 0)
-    if followers < 350:
+    if followers < 250:
         return False, f"too few followers ({followers})"
-    if followers > 20000:
+    if followers > 10000:
         return False, f"too many followers ({followers})"
 
     posts = profile_data.get("post_count", 0)
