@@ -38,6 +38,7 @@ from scraper import (
     get_instagram_pic_url,
     get_storage_pic_url,
     ProfileNotFoundError,
+    _supabase_client,
 )
 
 app = FastAPI(title="Social Scout API")
@@ -524,3 +525,241 @@ def get_profile(username: str):
     profile["profile_image_url"] = get_storage_pic_url(profile["username"])
 
     return {"data": profile}
+
+
+# ===========================================================================
+# ADMIN / RECOMMENDATION BACKEND ENDPOINTS
+# ===========================================================================
+# These endpoints exist to let you exercise the recommendation pipeline from
+# the frontend admin page. They're intentionally unauthenticated for the
+# prototype — wrap with auth before exposing publicly.
+# ===========================================================================
+
+class CreateCityRequest(BaseModel):
+    name: str
+    state: str
+    country: str = "US"
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+
+class CreateUserRequest(BaseModel):
+    email: str
+    name: Optional[str] = None
+    city_id: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+
+@app.post("/api/admin/cities")
+def admin_create_city(req: CreateCityRequest):
+    """Create a city row. Starts in 'seeding' status."""
+    supabase = _supabase_client()
+    payload = {
+        "name": req.name,
+        "state": req.state,
+        "country": req.country,
+        "lat": req.lat,
+        "lng": req.lng,
+        "status": "seeding",
+    }
+    try:
+        result = supabase.table("cities").upsert(
+            payload, on_conflict="name,state,country"
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Create city failed: {e}")
+    return {"city": result.data[0] if result.data else payload}
+
+
+@app.get("/api/admin/cities")
+def admin_list_cities():
+    supabase = _supabase_client()
+    res = supabase.table("cities").select("*").order("created_at").execute()
+    return {"cities": res.data or []}
+
+
+@app.post("/api/admin/cities/{city_id}/seed")
+def admin_seed_city(city_id: str, max_anchors: int | None = None):
+    """Run the Claude seeder for this city synchronously. Takes 30s–2min depending
+    on how many candidates pass validation.
+
+    Query param `max_anchors`: if set, stop after that many eligible anchors have
+    been inserted (useful for cheap testing).
+    """
+    from workers.city_seeder import seed_city
+    try:
+        stats = seed_city(city_id, max_anchors=max_anchors)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Seed failed: {e}")
+    return {"stats": stats}
+
+
+@app.get("/api/admin/cities/{city_id}/anchors")
+def admin_list_anchors(city_id: str):
+    supabase = _supabase_client()
+    res = (
+        supabase.table("anchor_locations")
+        .select("*")
+        .eq("city_id", city_id)
+        .order("follower_count", desc=True)
+        .execute()
+    )
+    return {"anchors": res.data or []}
+
+
+@app.post("/api/admin/users")
+def admin_create_user(req: CreateUserRequest):
+    """Create a test user. Computes first_eligible_drop_at via the SQL helper."""
+    supabase = _supabase_client()
+    # Compute first_eligible_drop_at via the Postgres function
+    try:
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        helper = supabase.rpc("compute_first_eligible_drop", {"p_signup_time": now_iso}).execute()
+        first_eligible = helper.data
+    except Exception:
+        first_eligible = None
+
+    payload = {
+        "email": req.email,
+        "name": req.name,
+        "city_id": req.city_id,
+        "lat": req.lat,
+        "lng": req.lng,
+        "first_eligible_drop_at": first_eligible,
+    }
+    try:
+        result = supabase.table("users").upsert(payload, on_conflict="email").execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Create user failed: {e}")
+    return {"user": result.data[0] if result.data else payload}
+
+
+@app.get("/api/admin/users")
+def admin_list_users():
+    supabase = _supabase_client()
+    res = supabase.table("users").select("*").order("created_at", desc=True).execute()
+    return {"users": res.data or []}
+
+
+@app.post("/api/admin/drop_prep")
+def admin_run_drop_prep():
+    """Run a full drop-prep pass NOW. This is the expensive endpoint — it will
+    spend Apify + Grok credits proportional to how many users have gaps."""
+    from workers.drop_prep import run_drop_prep
+    try:
+        stats = run_drop_prep()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Drop prep failed: {e}")
+    return {"stats": stats}
+
+
+@app.post("/api/admin/run_drop")
+def admin_run_drop():
+    """Execute the drop now — inserts up to 10 recommendations per eligible user."""
+    from workers.drop_prep import run_drop_execution
+    try:
+        stats = run_drop_execution()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Drop execution failed: {e}")
+    return {"stats": stats}
+
+
+@app.get("/api/admin/users/{user_id}/recommendations")
+def admin_user_recs(user_id: str):
+    """Return this user's recommendations + their current dry-run candidate count."""
+    supabase = _supabase_client()
+
+    recs = (
+        supabase.table("user_recommendations")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("drop_date", desc=True)
+        .order("rank")
+        .execute()
+    ).data or []
+
+    # Enrich with profile data for display
+    if recs:
+        usernames = list({r["profile_username"] for r in recs})
+        profs = (
+            supabase.table("profiles")
+            .select("username,name,followers,attractiveness_rating,city_id,analysis_state")
+            .in_("username", usernames)
+            .execute()
+        ).data or []
+        prof_map = {p["username"]: p for p in profs}
+        for r in recs:
+            p = prof_map.get(r["profile_username"], {})
+            r["profile"] = p
+            r["profile_image_url"] = get_storage_pic_url(r["profile_username"])
+
+    # Dry-run candidate count (what a drop right now WOULD give them)
+    try:
+        from datetime import date
+        dry = supabase.rpc(
+            "curate_drop_for_user",
+            {"p_user_id": user_id, "p_drop_date": date.today().isoformat(), "p_dry_run": True},
+        ).execute()
+        available_now = len(dry.data or [])
+    except Exception:
+        available_now = None
+
+    return {
+        "recommendations": recs,
+        "available_now": available_now,
+    }
+
+
+@app.get("/api/admin/state")
+def admin_state():
+    """One-shot snapshot of system state for the admin UI."""
+    supabase = _supabase_client()
+
+    def safe_count(table, **filters):
+        try:
+            q = supabase.table(table).select("*", count="exact")
+            for k, v in filters.items():
+                q = q.eq(k, v)
+            return q.execute().count or 0
+        except Exception:
+            return 0
+
+    return {
+        "cities_total": safe_count("cities"),
+        "cities_active": safe_count("cities", status="active"),
+        "anchors_pending": safe_count("anchor_locations", status="pending"),
+        "anchors_done": safe_count("anchor_locations", status="done"),
+        "anchors_invalid": safe_count("anchor_locations", status="invalid"),
+        "profiles_qualified": safe_count("profiles", analysis_state="qualified"),
+        "profiles_disqualified": safe_count("profiles", analysis_state="disqualified"),
+        "queue_queued": safe_count("analysis_queue", status="queued"),
+        "queue_in_progress": safe_count("analysis_queue", status="in_progress"),
+        "queue_failed": safe_count("analysis_queue", status="failed"),
+        "users": safe_count("users"),
+    }
+
+
+@app.get("/api/admin/schema_check")
+def admin_schema_check():
+    """Quick check — returns which of the expected tables exist."""
+    supabase = _supabase_client()
+    results = {}
+    for table in ["cities", "anchor_locations", "analysis_queue", "users", "user_recommendations"]:
+        try:
+            supabase.table(table).select("*").limit(1).execute()
+            results[table] = True
+        except Exception:
+            results[table] = False
+
+    # Check function existence via a harmless call
+    try:
+        supabase.rpc("compute_first_eligible_drop", {
+            "p_signup_time": "2026-01-01T00:00:00Z"
+        }).execute()
+        results["compute_first_eligible_drop"] = True
+    except Exception:
+        results["compute_first_eligible_drop"] = False
+
+    return {"schema": results, "ready": all(results.values())}

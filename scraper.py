@@ -648,21 +648,52 @@ def get_storage_pic_url(username: str) -> str:
 # 6. Supabase write
 # ---------------------------------------------------------------------------
 
-def write_to_supabase(data: dict):
-    """Upsert the profile data into the Supabase profiles table."""
+def _supabase_client():
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_KEY")
-
     if not url or not key:
         raise RuntimeError("SUPABASE_URL and SUPABASE_KEY must be set in .env")
+    return create_client(url, key)
 
-    supabase = create_client(url, key)
+
+def profile_exists(username: str) -> bool:
+    """Returns True if a profiles row (qualified OR disqualified) exists for this username.
+
+    Used as the dedupe gate before any paid Apify analysis — if we've already
+    seen this username, we never pay to re-analyze.
+    """
+    try:
+        supabase = _supabase_client()
+        result = (
+            supabase.table("profiles")
+            .select("username")
+            .eq("username", username)
+            .limit(1)
+            .execute()
+        )
+        return bool(result.data)
+    except Exception as e:
+        print(f"  ⚠ profile_exists check failed for @{username}: {e}")
+        return False
+
+
+def write_to_supabase(data: dict):
+    """Upsert the profile data into the Supabase profiles table.
+
+    Accepts any of the extended fields: city_id, analysis_state,
+    disqualification_reason, analyzed_at.
+    """
+    supabase = _supabase_client()
 
     # Add timestamp
     data["last_scraped"] = datetime.now(timezone.utc).isoformat()
+    if "analyzed_at" not in data:
+        data["analyzed_at"] = data["last_scraped"]
+    if "analysis_state" not in data:
+        data["analysis_state"] = "qualified"
 
     # Debug: print what we're sending
-    print(f"  Upserting data for @{data.get('username')} …")
+    print(f"  Upserting data for @{data.get('username')} (state={data.get('analysis_state')}) …")
 
     result = supabase.table("profiles").upsert(data, on_conflict="username").execute()
 
@@ -673,6 +704,161 @@ def write_to_supabase(data: dict):
         print(f"  ⚠ Supabase returned no data. Full response: {result}")
 
     return result
+
+
+def save_disqualified_stub(username: str, reason: str, city_id: str | None = None):
+    """Save a minimal stub row for a disqualified profile so we never re-analyze it.
+
+    Only the fields needed for dedupe: username, analysis_state, reason, city_id, analyzed_at.
+    """
+    stub = {
+        "username": username,
+        "analysis_state": "disqualified",
+        "disqualification_reason": reason[:500] if reason else "unknown",
+    }
+    if city_id:
+        stub["city_id"] = city_id
+    try:
+        write_to_supabase(stub)
+    except Exception as e:
+        print(f"  ⚠ Failed to save disqualified stub for @{username}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 7. Unified follower analysis pipeline
+# ---------------------------------------------------------------------------
+
+def analyze_and_save_follower(
+    username: str,
+    city_id: str | None = None,
+    anchor_id: str | None = None,
+    on_step=None,
+) -> dict:
+    """Run the full follower qualification pipeline and persist the outcome.
+
+    - Checks profile dedupe first; if username already in profiles, returns early.
+    - Runs username precheck → scrape → basic qual → bio → vision → full analysis.
+    - Every outcome (qualified or disqualified at any stage) is persisted to
+      `profiles` so we never re-pay for the same username.
+
+    Returns: {"status": "qualified"|"disqualified"|"skipped_existing"|"error",
+              "reason": str, "data": dict | None}
+    """
+    def step(msg: str):
+        if on_step:
+            try:
+                on_step(msg)
+            except Exception:
+                pass
+
+    # Dedupe gate — the core cost-saving mechanism
+    if profile_exists(username):
+        return {"status": "skipped_existing", "reason": "already in profiles", "data": None}
+
+    # Step 0: Username precheck (cheap — Grok text only)
+    step("Username precheck")
+    if not precheck_username(username):
+        reason = "username sounds like a business/organization"
+        save_disqualified_stub(username, reason, city_id)
+        return {"status": "disqualified", "reason": reason, "data": None}
+
+    # Step 1: Scrape profile (paid Apify call)
+    step("Scraping profile")
+    try:
+        profile_data, raw_apify_data = scrape_profile(username)
+    except ProfileNotFoundError as e:
+        # Save a stub so we don't retry a dead account
+        save_disqualified_stub(username, f"profile not found: {e}", city_id)
+        return {"status": "disqualified", "reason": str(e), "data": None}
+
+    # Step 2: Basic qualification (free)
+    step("Basic qualification")
+    passed, reason = qualify_follower_basic(profile_data, raw_apify_data)
+    if not passed:
+        save_disqualified_stub(username, reason, city_id)
+        return {"status": "disqualified", "reason": reason, "data": None}
+
+    # Step 2b: Follower ratio
+    follower_ratio = profile_data.get("follower_ratio")
+    if follower_ratio is not None and follower_ratio < 1:
+        reason = f"follower ratio too low ({follower_ratio})"
+        save_disqualified_stub(username, reason, city_id)
+        return {"status": "disqualified", "reason": reason, "data": None}
+
+    # Step 2c: Engagement precheck (non-private only)
+    engagement_data: dict = {}
+    if not profile_data.get("is_private", False):
+        eng = calculate_engagement(raw_apify_data, profile_data.get("followers", 0))
+        engagement_data = eng
+        eng_rate = eng.get("engagement_rate")
+        if eng_rate is not None and eng_rate < 5:
+            reason = f"engagement rate too low ({eng_rate}%)"
+            save_disqualified_stub(username, reason, city_id)
+            return {"status": "disqualified", "reason": reason, "data": None}
+
+    # Step 2d: Bio precheck
+    bio = profile_data.get("bio") or ""
+    if bio.strip():
+        step("Bio precheck")
+        bio_check = precheck_bio(bio)
+        if any([bio_check.get("is_parent"), bio_check.get("in_relationship"),
+                bio_check.get("too_old"), bio_check.get("other_disqualifier")]):
+            flags = []
+            if bio_check.get("is_parent"): flags.append("parent")
+            if bio_check.get("in_relationship"): flags.append("in relationship")
+            if bio_check.get("too_old"): flags.append("too old")
+            if bio_check.get("other_disqualifier"): flags.append("other disqualifier")
+            reason = f"bio signals: {', '.join(flags)}"
+            save_disqualified_stub(username, reason, city_id)
+            return {"status": "disqualified", "reason": reason, "data": None}
+
+    # Step 3: Vision precheck
+    pic_url = get_instagram_pic_url(raw_apify_data)
+    if not pic_url:
+        reason = "no profile picture available"
+        save_disqualified_stub(username, reason, city_id)
+        return {"status": "disqualified", "reason": reason, "data": None}
+
+    step("Vision precheck")
+    precheck = precheck_profile_pic(pic_url)
+    passed, reason = qualify_follower_vision(precheck)
+    if not passed:
+        save_disqualified_stub(username, reason, city_id)
+        return {"status": "disqualified", "reason": reason, "data": None}
+
+    # Step 4: Full analysis
+    step("Full vision analysis")
+    if not engagement_data:
+        try:
+            engagement_data = calculate_engagement(raw_apify_data, profile_data["followers"])
+        except Exception:
+            engagement_data = {"avg_likes": None, "avg_comments": None, "engagement_rate": None}
+
+    vision_data = analyze_profile_pic(pic_url)
+
+    # Age re-check
+    full_age = vision_data.get("estimated_age")
+    if full_age is not None and (full_age < 18 or full_age > 36):
+        reason = f"full analysis estimated age {full_age} outside 18-36 range"
+        save_disqualified_stub(username, reason, city_id)
+        return {"status": "disqualified", "reason": reason, "data": None}
+
+    # Step 5: Upload pic + save qualified
+    step("Uploading profile pic")
+    upload_profile_pic(username, pic_url)
+
+    step("Saving qualified profile")
+    merged = {**profile_data, **engagement_data, **vision_data}
+    merged["analysis_state"] = "qualified"
+    if city_id:
+        merged["city_id"] = city_id
+
+    try:
+        write_to_supabase(merged)
+    except Exception as e:
+        return {"status": "error", "reason": f"Supabase write failed: {e}", "data": merged}
+
+    return {"status": "qualified", "reason": "saved to database", "data": merged}
 
 
 # ---------------------------------------------------------------------------
