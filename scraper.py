@@ -266,6 +266,7 @@ def analyze_profile_pic(profile_pic_url: str) -> dict:
             ],
             max_tokens=200,
             response_format={"type": "json_object"},
+            timeout=30,
         )
 
         raw = response.choices[0].message.content.strip()
@@ -342,6 +343,7 @@ def precheck_username(username: str) -> bool:
             messages=[{"role": "user", "content": prompt}],
             max_tokens=50,
             response_format={"type": "json_object"},
+            timeout=15,
         )
 
         raw = response.choices[0].message.content.strip()
@@ -418,6 +420,7 @@ def precheck_bio(bio: str) -> dict:
             messages=[{"role": "user", "content": prompt}],
             max_tokens=100,
             response_format={"type": "json_object"},
+            timeout=15,
         )
 
         raw = response.choices[0].message.content.strip()
@@ -521,6 +524,7 @@ def precheck_profile_pic(profile_pic_url: str) -> dict:
             ],
             max_tokens=100,
             response_format={"type": "json_object"},
+            timeout=30,
         )
 
         raw = response.choices[0].message.content.strip()

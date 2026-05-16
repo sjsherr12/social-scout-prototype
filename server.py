@@ -275,14 +275,6 @@ def _process_single_follower_for_scan(
 ):
     """Process a single follower, pushing step-by-step events to the queue."""
 
-    # Step 0: Username precheck
-    q.put({"event": "follower_step", "username": username, "step": "Username precheck"})
-    if not precheck_username(username):
-        q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": "username sounds like a business/organization"})
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
-        return
-
     # Step 1: Scrape profile
     q.put({"event": "follower_step", "username": username, "step": "Scraping profile"})
     profile_data, raw_apify_data = scrape_profile(username)
@@ -298,7 +290,7 @@ def _process_single_follower_for_scan(
 
     # Step 2b: Follower ratio precheck
     follower_ratio = profile_data.get("follower_ratio")
-    if follower_ratio is not None and follower_ratio < 1:
+    if follower_ratio is not None and follower_ratio < 0.9:
         q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": f"follower ratio too low ({follower_ratio})"})
         stats["disqualified"] += 1
         mark_processed(target_username, username)
@@ -313,6 +305,14 @@ def _process_single_follower_for_scan(
             stats["disqualified"] += 1
             mark_processed(target_username, username)
             return
+
+    # Step 2d: Username precheck (Grok text — runs only after numerical filters pass)
+    q.put({"event": "follower_step", "username": username, "step": "Username precheck"})
+    if not precheck_username(username):
+        q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": "username sounds like a business/organization"})
+        stats["disqualified"] += 1
+        mark_processed(target_username, username)
+        return
 
     # Step 2c: Bio precheck
     bio = profile_data.get("bio") or ""

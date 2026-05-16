@@ -71,13 +71,6 @@ def process_single_follower(target_username: str, username: str, stats: dict,
                             location_data: dict = None):
     """Process a single follower through the qualification pipeline."""
 
-    # Step 0: Username precheck (text-only, no API scrape needed)
-    if not precheck_username(username):
-        print(f"    SKIP: username sounds like a business/organization")
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
-        return
-
     # Step 1: Scrape profile metadata via Apify (reuse existing function)
     profile_data, raw_apify_data = scrape_profile(username)
 
@@ -91,7 +84,7 @@ def process_single_follower(target_username: str, username: str, stats: dict,
 
     # Step 2b: Follower ratio precheck
     follower_ratio = profile_data.get("follower_ratio")
-    if follower_ratio is not None and follower_ratio < 1:
+    if follower_ratio is not None and follower_ratio < 0.9:
         print(f"    SKIP: follower ratio too low ({follower_ratio})")
         stats["disqualified"] += 1
         mark_processed(target_username, username)
@@ -106,6 +99,13 @@ def process_single_follower(target_username: str, username: str, stats: dict,
             stats["disqualified"] += 1
             mark_processed(target_username, username)
             return
+
+    # Step 2d: Username precheck (Grok text — runs only after numerical filters pass)
+    if not precheck_username(username):
+        print(f"    SKIP: username sounds like a business/organization")
+        stats["disqualified"] += 1
+        mark_processed(target_username, username)
+        return
 
     # Step 3: Vision precheck (lightweight — visible person, gender, age)
     pic_url = get_instagram_pic_url(raw_apify_data)
