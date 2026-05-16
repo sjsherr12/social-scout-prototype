@@ -30,43 +30,14 @@ def extract_username(input_str: str) -> str:
 ACTOR_ID = "dSCLg0C3YEZ83HzYX"  # apify/instagram-profile-scraper
 
 
-def scrape_profile(username: str) -> dict:
-    """
-    Fetch profile metadata using Apify's Instagram Profile Scraper.
-    Returns a dict with all profile fields.
-    """
-    token = os.getenv("APIFY_API_TOKEN")
-    if not token:
-        raise RuntimeError("APIFY_API_TOKEN must be set in .env")
-
-    client = ApifyClient(token)
-
-    run_input = {
-        "usernames": [username],
-    }
-
-    print(f"  Running Apify scraper for @{username} …")
-    run = client.actor(ACTOR_ID).call(run_input=run_input, timeout_secs=120)
-
-    # Fetch results from the run's dataset
-    items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
-
-    if not items:
-        raise ProfileNotFoundError(
-            f"Apify returned no data for @{username}. "
-            f"The profile may not exist or may be private."
-        )
-
-    raw = items[0]  # we only scraped one profile
-
-    # Map Apify fields to our schema
+def _map_apify_profile(raw: dict, fallback_username: str = None) -> dict:
+    """Map a raw Apify Instagram profile item to our schema."""
     followers = raw.get("followersCount", 0)
     following = raw.get("followsCount", 0)
     post_count = raw.get("postsCount", 0)
     follower_ratio = round(followers / following, 4) if following else None
-
-    data = {
-        "username": raw.get("username", username),
+    return {
+        "username": raw.get("username", fallback_username),
         "name": raw.get("fullName"),
         "followers": followers,
         "following": following,
@@ -76,7 +47,60 @@ def scrape_profile(username: str) -> dict:
         "follower_ratio": follower_ratio,
     }
 
-    return data, raw
+
+def scrape_profile(username: str) -> dict:
+    """
+    Fetch profile metadata using Apify's Instagram Profile Scraper.
+    Returns (data, raw_apify_data).
+    """
+    token = os.getenv("APIFY_API_TOKEN")
+    if not token:
+        raise RuntimeError("APIFY_API_TOKEN must be set in .env")
+
+    client = ApifyClient(token)
+    run_input = {"usernames": [username]}
+
+    print(f"  Running Apify scraper for @{username} …")
+    run = client.actor(ACTOR_ID).call(run_input=run_input, timeout_secs=120)
+    items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+
+    if not items:
+        raise ProfileNotFoundError(
+            f"Apify returned no data for @{username}. "
+            f"The profile may not exist or may be private."
+        )
+
+    raw = items[0]
+    return _map_apify_profile(raw, fallback_username=username), raw
+
+
+def scrape_profiles_batch(usernames: list[str]) -> dict:
+    """
+    Batch-scrape multiple Instagram profiles in a single Apify actor run.
+    Returns a dict mapping lowercased-username -> (profile_data, raw_apify_data).
+    Usernames not returned by Apify (private, nonexistent, etc.) are omitted.
+    """
+    if not usernames:
+        return {}
+
+    token = os.getenv("APIFY_API_TOKEN")
+    if not token:
+        raise RuntimeError("APIFY_API_TOKEN must be set in .env")
+
+    client = ApifyClient(token)
+    run_input = {"usernames": usernames}
+
+    print(f"  Batch-scraping {len(usernames)} profiles via Apify …")
+    run = client.actor(ACTOR_ID).call(run_input=run_input, timeout_secs=300)
+    items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+
+    results = {}
+    for raw in items:
+        uname = raw.get("username")
+        if not uname:
+            continue
+        results[uname.lower()] = (_map_apify_profile(raw, fallback_username=uname), raw)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +400,12 @@ BIO_PRECHECK_PROMPT = (
     '  "too_old": (boolean — true if the bio contains signals suggesting they are '
     "significantly older than mid-30s, e.g. mentions grandchildren, retirement, "
     "class of '85, etc.),\n"
+    '  "is_political": (boolean — true if the bio contains ANY political content, '
+    "activism slogans, advocacy hashtags, or politically charged statements of any "
+    'ideology or side. Examples include but are not limited to: "Free Palestine", '
+    '"BLM", "Resist", "ACAB", "pro-life", "pro-choice", mentions of specific '
+    "candidates/parties, social-justice slogans, or any other clearly "
+    "political/activist messaging.),\n"
     '  "other_disqualifier": (boolean — true if there are any other clear signals '
     "that would make them ineligible for a romantic partnership, e.g. memorial "
     "account, business-only account, explicitly not looking for dating, etc.)\n\n"
@@ -396,6 +426,7 @@ def precheck_bio(bio: str) -> dict:
         "is_parent": False,
         "in_relationship": False,
         "too_old": False,
+        "is_political": False,
         "other_disqualifier": False,
     }
 
@@ -434,6 +465,7 @@ def precheck_bio(bio: str) -> dict:
             "is_parent": result.get("is_parent", False),
             "in_relationship": result.get("in_relationship", False),
             "too_old": result.get("too_old", False),
+            "is_political": result.get("is_political", False),
             "other_disqualifier": result.get("other_disqualifier", False),
         }
 

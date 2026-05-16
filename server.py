@@ -11,6 +11,8 @@ import queue
 import threading
 import time
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -27,6 +29,7 @@ from scraper import (
     analyze_profile_pic,
     write_to_supabase,
     fetch_followers,
+    scrape_profiles_batch,
     load_processed,
     mark_processed,
     precheck_username,
@@ -193,7 +196,6 @@ def _run_scan(
     stop_event: threading.Event,
 ):
     """Run the follower scan pipeline in a background thread, pushing events to the queue."""
-    SCAN_DELAY_SECONDS = 2
 
     try:
         # Load already-processed
@@ -227,31 +229,93 @@ def _run_scan(
             q.put({"event": "complete", "stats": {"qualified": 0, "disqualified": 0, "errors": 0}, "message": "All followers already processed"})
             return
 
+        stats = {"qualified": 0, "disqualified": 0, "errors": 0}
         q.put({"event": "scan_started", "total": total})
 
-        stats = {"qualified": 0, "disqualified": 0, "errors": 0}
+        BATCH_SIZE = 50
+        MAX_WORKERS = 10
 
-        for i, follower in enumerate(remaining, 1):
+        stats_lock = threading.Lock()
+        progress_counter = {"n": 0}
+
+        def _worker(follower: str, pdata: dict, raw: dict):
+            if stop_event.is_set():
+                return
+            try:
+                _process_single_follower_for_scan(
+                    username, follower, stats, location_data, q,
+                    profile_data=pdata, raw_apify_data=raw,
+                    lock=stats_lock,
+                )
+            except ProfileNotFoundError as e:
+                q.put({"event": "follower_result", "username": follower, "status": "error", "reason": str(e)})
+                with stats_lock:
+                    stats["errors"] += 1
+                    mark_processed(username, follower)
+            except Exception as e:
+                q.put({"event": "follower_result", "username": follower, "status": "error", "reason": f"{type(e).__name__}: {e}"})
+                with stats_lock:
+                    stats["errors"] += 1
+            finally:
+                with stats_lock:
+                    progress_counter["n"] += 1
+                    current = progress_counter["n"]
+                    q.put({"event": "progress", "current": current, "total": total, "stats": dict(stats)})
+
+        stopped = False
+        for batch_start in range(0, total, BATCH_SIZE):
             if stop_event.is_set():
                 q.put({"event": "info", "message": "Scan stopped by user"})
+                stopped = True
                 break
 
-            q.put({"event": "follower_start", "current": i, "total": total, "username": follower})
+            batch = remaining[batch_start:batch_start + BATCH_SIZE]
+            q.put({"event": "status", "message": f"Batch-scraping {len(batch)} profiles..."})
 
             try:
-                result = _process_single_follower_for_scan(username, follower, stats, location_data, q)
-            except ProfileNotFoundError as e:
-                q.put({"event": "follower_result", "current": i, "total": total, "username": follower, "status": "error", "reason": str(e)})
-                mark_processed(username, follower)
-                stats["errors"] += 1
+                scraped = scrape_profiles_batch(batch)
             except Exception as e:
-                q.put({"event": "follower_result", "current": i, "total": total, "username": follower, "status": "error", "reason": f"{type(e).__name__}: {e}"})
-                stats["errors"] += 1
+                q.put({"event": "error", "message": f"Batch scrape failed: {e}"})
+                for follower in batch:
+                    with stats_lock:
+                        stats["errors"] += 1
+                        progress_counter["n"] += 1
+                        current = progress_counter["n"]
+                        q.put({"event": "follower_result", "username": follower, "status": "error", "reason": "batch scrape failed"})
+                        q.put({"event": "progress", "current": current, "total": total, "stats": dict(stats)})
+                continue
 
-            q.put({"event": "progress", "current": i, "total": total, "stats": dict(stats)})
+            to_process = []
+            for follower in batch:
+                entry = scraped.get(follower.lower())
+                if entry is None:
+                    with stats_lock:
+                        stats["errors"] += 1
+                        mark_processed(username, follower)
+                        progress_counter["n"] += 1
+                        current = progress_counter["n"]
+                        q.put({"event": "follower_result", "username": follower, "status": "error", "reason": "profile not returned by Apify (may not exist or be private)"})
+                        q.put({"event": "progress", "current": current, "total": total, "stats": dict(stats)})
+                    continue
+                to_process.append((follower, entry))
 
-            if i < total and not stop_event.is_set():
-                time.sleep(SCAN_DELAY_SECONDS)
+            q.put({"event": "status", "message": f"Running {len(to_process)} prechecks in parallel (max {MAX_WORKERS} concurrent)..."})
+
+            for follower, _ in to_process:
+                q.put({"event": "follower_start", "username": follower, "total": total})
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [
+                    executor.submit(_worker, follower, entry[0], entry[1])
+                    for follower, entry in to_process
+                ]
+                for fut in futures:
+                    fut.result()
+
+            if stop_event.is_set():
+                q.put({"event": "info", "message": "Scan stopped by user"})
+                stopped = True
+                break
 
         q.put({"event": "complete", "stats": dict(stats)})
 
@@ -272,28 +336,44 @@ def _process_single_follower_for_scan(
     stats: dict,
     location_data: dict,
     q: queue.Queue,
+    profile_data: dict = None,
+    raw_apify_data: dict = None,
+    lock=None,
 ):
-    """Process a single follower, pushing step-by-step events to the queue."""
+    """Process a single follower, pushing step-by-step events to the queue.
 
-    # Step 1: Scrape profile
-    q.put({"event": "follower_step", "username": username, "step": "Scraping profile"})
-    profile_data, raw_apify_data = scrape_profile(username)
+    If profile_data + raw_apify_data are provided (from a batch scrape), the
+    per-username Apify call is skipped.
+
+    If `lock` is provided, stats mutations and mark_processed writes are
+    serialized so this function is safe to call from multiple threads.
+    """
+    sync = lock if lock is not None else nullcontext()
+
+    def _record(status_key, do_mark=True):
+        with sync:
+            stats[status_key] += 1
+            if do_mark:
+                mark_processed(target_username, username)
+
+    # Step 1: Scrape profile (skipped if pre-scraped)
+    if profile_data is None or raw_apify_data is None:
+        q.put({"event": "follower_step", "username": username, "step": "Scraping profile"})
+        profile_data, raw_apify_data = scrape_profile(username)
 
     # Step 2: Basic qualification
     q.put({"event": "follower_step", "username": username, "step": "Basic qualification"})
     passed, reason = qualify_follower_basic(profile_data, raw_apify_data)
     if not passed:
         q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": reason})
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        _record("disqualified")
         return
 
     # Step 2b: Follower ratio precheck
     follower_ratio = profile_data.get("follower_ratio")
     if follower_ratio is not None and follower_ratio < 0.9:
         q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": f"follower ratio too low ({follower_ratio})"})
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        _record("disqualified")
         return
 
     # Step 2c: Engagement rate precheck (only for non-private accounts)
@@ -302,16 +382,14 @@ def _process_single_follower_for_scan(
         eng_rate = eng.get("engagement_rate")
         if eng_rate is not None and eng_rate < 5:
             q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": f"engagement rate too low ({eng_rate}%)"})
-            stats["disqualified"] += 1
-            mark_processed(target_username, username)
+            _record("disqualified")
             return
 
     # Step 2d: Username precheck (Grok text — runs only after numerical filters pass)
     q.put({"event": "follower_step", "username": username, "step": "Username precheck"})
     if not precheck_username(username):
         q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": "username sounds like a business/organization"})
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        _record("disqualified")
         return
 
     # Step 2c: Bio precheck
@@ -319,7 +397,7 @@ def _process_single_follower_for_scan(
     if bio.strip():
         q.put({"event": "follower_step", "username": username, "step": "Bio precheck"})
         bio_check = precheck_bio(bio)
-        if bio_check.get("is_parent") or bio_check.get("in_relationship") or bio_check.get("too_old") or bio_check.get("other_disqualifier"):
+        if bio_check.get("is_parent") or bio_check.get("in_relationship") or bio_check.get("too_old") or bio_check.get("is_political") or bio_check.get("other_disqualifier"):
             reasons = []
             if bio_check.get("is_parent"):
                 reasons.append("parent")
@@ -327,20 +405,20 @@ def _process_single_follower_for_scan(
                 reasons.append("in relationship")
             if bio_check.get("too_old"):
                 reasons.append("too old")
+            if bio_check.get("is_political"):
+                reasons.append("political content")
             if bio_check.get("other_disqualifier"):
                 reasons.append("other disqualifier")
             reason_str = ", ".join(reasons)
             q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": f"bio signals: {reason_str}"})
-            stats["disqualified"] += 1
-            mark_processed(target_username, username)
+            _record("disqualified")
             return
 
     # Step 3: Vision precheck
     pic_url = get_instagram_pic_url(raw_apify_data)
     if not pic_url:
         q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": "no profile picture available"})
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        _record("disqualified")
         return
 
     q.put({"event": "follower_step", "username": username, "step": "Vision precheck"})
@@ -349,8 +427,7 @@ def _process_single_follower_for_scan(
     passed, reason = qualify_follower_vision(precheck)
     if not passed:
         q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": reason})
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        _record("disqualified")
         return
 
     # Step 4: Full analysis
@@ -367,8 +444,7 @@ def _process_single_follower_for_scan(
     full_age = vision_data.get("estimated_age")
     if full_age is not None and (full_age < 18 or full_age > 28):
         q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": f"full analysis estimated age {full_age} outside 18-28 range"})
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        _record("disqualified")
         return
 
     # Step 5: Upload pic + Save
@@ -383,11 +459,11 @@ def _process_single_follower_for_scan(
     try:
         write_to_supabase(merged)
         q.put({"event": "follower_result", "username": username, "status": "qualified", "reason": "saved to database", "data": merged})
-        stats["qualified"] += 1
-        mark_processed(target_username, username)
+        _record("qualified")
     except Exception as e:
         q.put({"event": "follower_result", "username": username, "status": "error", "reason": f"Supabase write failed: {e}"})
-        stats["errors"] += 1
+        with sync:
+            stats["errors"] += 1
 
 
 # ---------------------------------------------------------------------------

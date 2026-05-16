@@ -33,12 +33,16 @@ Examples:
 import sys
 import time
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 from dotenv import load_dotenv
 
 from scraper import (
     extract_username,
     scrape_profile,
+    scrape_profiles_batch,
     calculate_engagement,
     analyze_profile_pic,
     write_to_supabase,
@@ -68,26 +72,42 @@ SCAN_DELAY_SECONDS = 2  # delay between processing each follower
 
 
 def process_single_follower(target_username: str, username: str, stats: dict,
-                            location_data: dict = None):
-    """Process a single follower through the qualification pipeline."""
+                            location_data: dict = None,
+                            profile_data: dict = None,
+                            raw_apify_data: dict = None,
+                            lock=None):
+    """Process a single follower through the qualification pipeline.
 
-    # Step 1: Scrape profile metadata via Apify (reuse existing function)
-    profile_data, raw_apify_data = scrape_profile(username)
+    If profile_data + raw_apify_data are provided (from a batch scrape), the
+    per-username Apify call is skipped.
+
+    If `lock` is provided (threading.Lock), stats mutations and mark_processed
+    writes are serialized so this function is safe to call from multiple threads.
+    """
+    sync = lock if lock is not None else nullcontext()
+
+    def _record(status_key, do_mark=True):
+        with sync:
+            stats[status_key] += 1
+            if do_mark:
+                mark_processed(target_username, username)
+
+    # Step 1: Scrape profile metadata via Apify (skipped if pre-scraped)
+    if profile_data is None or raw_apify_data is None:
+        profile_data, raw_apify_data = scrape_profile(username)
 
     # Step 2: Free qualification checks (follower count, account type)
     passed, reason = qualify_follower_basic(profile_data, raw_apify_data)
     if not passed:
-        print(f"    SKIP: {reason}")
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        print(f"    SKIP @{username}: {reason}")
+        _record("disqualified")
         return
 
     # Step 2b: Follower ratio precheck
     follower_ratio = profile_data.get("follower_ratio")
     if follower_ratio is not None and follower_ratio < 0.9:
-        print(f"    SKIP: follower ratio too low ({follower_ratio})")
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        print(f"    SKIP @{username}: follower ratio too low ({follower_ratio})")
+        _record("disqualified")
         return
 
     # Step 2c: Engagement rate precheck (only for non-private accounts)
@@ -95,43 +115,39 @@ def process_single_follower(target_username: str, username: str, stats: dict,
         eng = calculate_engagement(raw_apify_data, profile_data.get("followers", 0))
         eng_rate = eng.get("engagement_rate")
         if eng_rate is not None and eng_rate < 5:
-            print(f"    SKIP: engagement rate too low ({eng_rate}%)")
-            stats["disqualified"] += 1
-            mark_processed(target_username, username)
+            print(f"    SKIP @{username}: engagement rate too low ({eng_rate}%)")
+            _record("disqualified")
             return
 
     # Step 2d: Username precheck (Grok text — runs only after numerical filters pass)
     if not precheck_username(username):
-        print(f"    SKIP: username sounds like a business/organization")
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        print(f"    SKIP @{username}: username sounds like a business/organization")
+        _record("disqualified")
         return
 
     # Step 3: Vision precheck (lightweight — visible person, gender, age)
     pic_url = get_instagram_pic_url(raw_apify_data)
     if not pic_url:
-        print("    SKIP: no profile picture available")
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        print(f"    SKIP @{username}: no profile picture available")
+        _record("disqualified")
         return
 
     precheck = precheck_profile_pic(pic_url)
 
     passed, reason = qualify_follower_vision(precheck)
     if not passed:
-        print(f"    SKIP: {reason}")
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        print(f"    SKIP @{username}: {reason}")
+        _record("disqualified")
         return
 
     # Step 4: QUALIFIED — full scrape
-    print(f"    QUALIFIED — running full analysis …")
+    print(f"    QUALIFIED @{username} — running full analysis …")
 
     # Engagement (reuses already-fetched raw Apify data)
     try:
         engagement_data = calculate_engagement(raw_apify_data, profile_data["followers"])
     except Exception as e:
-        print(f"    ⚠ Engagement calculation failed: {e}")
+        print(f"    ⚠ Engagement calculation failed for @{username}: {e}")
         engagement_data = {"avg_likes": None, "avg_comments": None, "engagement_rate": None}
 
     # Full vision analysis (ethnicity, hair, attractiveness + estimated_age)
@@ -140,9 +156,8 @@ def process_single_follower(target_username: str, username: str, stats: dict,
     # Re-check age from full analysis (can differ from precheck estimate)
     full_age = vision_data.get("estimated_age")
     if full_age is not None and (full_age < 18 or full_age > 28):
-        print(f"    SKIP: full analysis estimated age {full_age} outside 18-28 range")
-        stats["disqualified"] += 1
-        mark_processed(target_username, username)
+        print(f"    SKIP @{username}: full analysis estimated age {full_age} outside 18-28 range")
+        _record("disqualified")
         return
 
     # Upload profile picture to Supabase Storage
@@ -156,11 +171,11 @@ def process_single_follower(target_username: str, username: str, stats: dict,
     try:
         write_to_supabase(merged)
         print(f"    ✓ @{username} saved to database!")
-        stats["qualified"] += 1
-        mark_processed(target_username, username)
+        _record("qualified")
     except Exception as e:
-        print(f"    ✗ Supabase write failed: {e}")
-        stats["errors"] += 1
+        print(f"    ✗ Supabase write failed for @{username}: {e}")
+        with sync:
+            stats["errors"] += 1
 
 
 def scan_followers(username: str, max_followers: int, location_data: dict = None):
@@ -219,26 +234,67 @@ def scan_followers(username: str, max_followers: int, location_data: dict = None
         print("  Nothing to do — all followers already processed.")
         return
 
-    # Process each remaining follower
+    # Process followers in batches — one Apify run per batch, then run each
+    # follower's precheck pipeline in parallel via a thread pool.
     print("[2/2] Processing followers …\n")
     stats = {"qualified": 0, "disqualified": 0, "errors": 0}
     total = len(remaining)
+    BATCH_SIZE = 50
+    MAX_WORKERS = 10
 
-    for i, follower in enumerate(remaining, 1):
-        print(f"  [{i}/{total}] @{follower}")
+    stats_lock = threading.Lock()
+
+    def _worker(follower: str, profile_data: dict, raw_apify_data: dict):
         try:
-            process_single_follower(username, follower, stats, location_data)
+            process_single_follower(
+                username, follower, stats, location_data,
+                profile_data=profile_data, raw_apify_data=raw_apify_data,
+                lock=stats_lock,
+            )
         except ProfileNotFoundError as e:
-            print(f"    SKIP: {e}")
-            mark_processed(username, follower)
-            stats["errors"] += 1
+            print(f"    SKIP @{follower}: {e}")
+            with stats_lock:
+                stats["errors"] += 1
+                mark_processed(username, follower)
         except Exception as e:
-            print(f"    ERROR: {type(e).__name__}: {e}")
-            stats["errors"] += 1
+            print(f"    ERROR @{follower}: {type(e).__name__}: {e}")
+            with stats_lock:
+                stats["errors"] += 1
 
-        # Rate limiting between followers
-        if i < total:
-            time.sleep(SCAN_DELAY_SECONDS)
+    processed_count = 0
+    for batch_start in range(0, total, BATCH_SIZE):
+        batch = remaining[batch_start:batch_start + BATCH_SIZE]
+        print(f"  Batch {batch_start // BATCH_SIZE + 1}: scraping {len(batch)} profiles …")
+
+        try:
+            scraped = scrape_profiles_batch(batch)
+        except Exception as e:
+            print(f"    ⚠ Batch scrape failed: {type(e).__name__}: {e} — skipping batch")
+            with stats_lock:
+                for _ in batch:
+                    stats["errors"] += 1
+            continue
+
+        to_process = []
+        for follower in batch:
+            processed_count += 1
+            entry = scraped.get(follower.lower())
+            if entry is None:
+                print(f"  [{processed_count}/{total}] @{follower} — SKIP: profile not returned by Apify")
+                with stats_lock:
+                    stats["errors"] += 1
+                    mark_processed(username, follower)
+                continue
+            to_process.append((follower, entry))
+
+        print(f"  Running {len(to_process)} prechecks in parallel (max {MAX_WORKERS} concurrent) …")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(_worker, follower, entry[0], entry[1])
+                for follower, entry in to_process
+            ]
+            for fut in futures:
+                fut.result()
 
     # Summary
     processed = stats["qualified"] + stats["disqualified"] + stats["errors"]

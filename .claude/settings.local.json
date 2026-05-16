@@ -10,7 +10,8 @@
       "Bash(timeout 5 python -c \"from server import app; print\\(''FastAPI app imports OK''\\)\")",
       "Bash(python -c \"from server import app; from scraper import upload_profile_pic, get_instagram_pic_url, get_storage_pic_url; print\\(''All imports OK''\\)\")",
       "Bash(python -c \"from main import main; print\\(''main.py imports OK''\\)\")",
-      "WebFetch(domain:apify.com)"
+      "WebFetch(domain:apify.com)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }
