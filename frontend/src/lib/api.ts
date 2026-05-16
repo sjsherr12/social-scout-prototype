@@ -6,6 +6,7 @@ export interface Profile {
   name?: string;
   followers?: number;
   following?: number;
+  follower_ratio?: number;
   bio?: string;
   profile_image_url?: string;
   is_private?: boolean;

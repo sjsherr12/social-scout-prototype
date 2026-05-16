@@ -365,8 +365,8 @@ def _process_single_follower_for_scan(
 
     # Re-check age from full analysis
     full_age = vision_data.get("estimated_age")
-    if full_age is not None and (full_age < 18 or full_age > 36):
-        q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": f"full analysis estimated age {full_age} outside 18-36 range"})
+    if full_age is not None and (full_age < 18 or full_age > 28):
+        q.put({"event": "follower_result", "username": username, "status": "disqualified", "reason": f"full analysis estimated age {full_age} outside 18-28 range"})
         stats["disqualified"] += 1
         mark_processed(target_username, username)
         return

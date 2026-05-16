@@ -248,7 +248,7 @@ def analyze_profile_pic(profile_pic_url: str) -> dict:
         )
 
         response = client.chat.completions.create(
-            model="grok-4.20-0309-non-reasoning",
+            model="grok-4.3",
             messages=[
                 {
                     "role": "user",
@@ -338,7 +338,7 @@ def precheck_username(username: str) -> bool:
         prompt = USERNAME_PRECHECK_PROMPT.replace("{username}", username)
 
         response = client.chat.completions.create(
-            model="grok-4.20-0309-non-reasoning",
+            model="grok-4.3",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=50,
             response_format={"type": "json_object"},
@@ -414,7 +414,7 @@ def precheck_bio(bio: str) -> dict:
         prompt = BIO_PRECHECK_PROMPT.replace("{bio}", bio)
 
         response = client.chat.completions.create(
-            model="grok-4.20-0309-non-reasoning",
+            model="grok-4.3",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=100,
             response_format={"type": "json_object"},
@@ -464,7 +464,7 @@ PRECHECK_VISION_PROMPT = (
     '  - Woman pictured intimately with a man (e.g. couple pose, arms around each other — "likely in relationship")\n'
     '  - Child or baby present (e.g. "child in photo, likely a parent")\n'
     '  - Wedding ring or wedding attire visible (e.g. "wedding imagery, likely married")\n'
-    '  - Any other signal suggesting the person is in a relationship, is a parent, or is outside the 20-32 age range\n'
+    '  - Any other signal suggesting the person is in a relationship, is a parent, or is outside the 18-28 age range\n'
     "  - If none of these apply, set disqualify_reason to null\n"
     "  - Do NOT disqualify just because friends are in the photo\n"
     "\n"
@@ -503,7 +503,7 @@ def precheck_profile_pic(profile_pic_url: str) -> dict:
         )
 
         response = client.chat.completions.create(
-            model="grok-4.20-0309-non-reasoning",
+            model="grok-4.3",
             messages=[
                 {
                     "role": "user",
@@ -584,8 +584,8 @@ def qualify_follower_vision(precheck_result: dict) -> tuple:
         return False, f"gender is {gender}, not female"
 
     age = precheck_result.get("estimated_age", 0)
-    if age < 20 or age > 32:
-        return False, f"estimated age {age} outside 20-32 range"
+    if age < 18 or age > 28:
+        return False, f"estimated age {age} outside 18-28 range"
 
     disqualify_reason = precheck_result.get("disqualify_reason")
     if disqualify_reason:
