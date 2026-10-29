@@ -11,7 +11,14 @@
       "Bash(python -c \"from server import app; from scraper import upload_profile_pic, get_instagram_pic_url, get_storage_pic_url; print\\(''All imports OK''\\)\")",
       "Bash(python -c \"from main import main; print\\(''main.py imports OK''\\)\")",
       "WebFetch(domain:apify.com)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('server.py'\\).read\\(\\)\\); print\\('server.py: syntax OK'\\)\")",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(node -e \"const p=require\\('./package.json'\\); console.log\\('tailwind:', \\(p.dependencies&&p.dependencies.tailwindcss\\)||\\(p.devDependencies&&p.devDependencies.tailwindcss\\)\\); console.log\\('lucide:', \\(p.dependencies&&p.dependencies['lucide-react']\\)||\\(p.devDependencies&&p.devDependencies['lucide-react']\\)\\);\")",
+      "Bash(echo \"---import exit: $?---\")",
+      "Bash(ps -o pid,ppid,etime,command -ax)",
+      "Bash(awk '$2==44995')",
+      "Bash(lsof -nP -iTCP:8000 -sTCP:LISTEN)"
     ]
   }
 }

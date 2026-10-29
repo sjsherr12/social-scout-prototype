@@ -66,12 +66,23 @@ class ScanRequest(BaseModel):
     location_slug: Optional[str] = None
 
 
+class KeywordScanRequest(BaseModel):
+    username: str
+    keyword: str
+    max_followers: Optional[int] = None
+
+
 # ---------------------------------------------------------------------------
 # In-memory scan state
 # ---------------------------------------------------------------------------
 
 # Maps scan_id -> { "queue": Queue, "thread": Thread, "stop": Event }
 active_scans: dict[str, dict] = {}
+
+# Keyword bio-scans are tracked entirely separately from the qualification
+# pipeline above. Maps scan_id -> { "queue", "thread", "stop", "matches",
+# "keyword", "username" }
+active_keyword_scans: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +527,211 @@ def stop_scan(scan_id: str):
         raise HTTPException(status_code=404, detail="Scan not found")
     active_scans[scan_id]["stop"].set()
     return {"status": "stopping"}
+
+
+# ===========================================================================
+# Keyword Bio-Scan  —  completely separate from the qualification pipeline.
+#
+# Fetches a target account's followers, scrapes each one, and collects any
+# whose bio contains a given keyword. No qualification, no vision analysis,
+# no Supabase writes — results are streamed live and held in memory only.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# POST /api/keyword-scan  —  Start a keyword bio-scan
+# ---------------------------------------------------------------------------
+
+@app.post("/api/keyword-scan")
+def start_keyword_scan(req: KeywordScanRequest):
+    username = extract_username(req.username)
+    keyword = (req.keyword or "").strip()
+    if not keyword:
+        raise HTTPException(status_code=400, detail="Keyword must not be empty")
+
+    scan_id = str(uuid.uuid4())
+    q = queue.Queue()
+    stop_event = threading.Event()
+
+    thread = threading.Thread(
+        target=_run_keyword_scan,
+        args=(scan_id, username, keyword, req.max_followers, q, stop_event),
+        daemon=True,
+    )
+
+    active_keyword_scans[scan_id] = {
+        "queue": q,
+        "thread": thread,
+        "stop": stop_event,
+        "matches": [],
+        "keyword": keyword,
+        "username": username,
+    }
+    thread.start()
+
+    return {"scan_id": scan_id, "username": username, "keyword": keyword}
+
+
+def _run_keyword_scan(
+    scan_id: str,
+    username: str,
+    keyword: str,
+    max_followers: Optional[int],
+    q: queue.Queue,
+    stop_event: threading.Event,
+):
+    """Fetch the target's followers, scrape each, and collect bios containing the keyword."""
+    state = active_keyword_scans[scan_id]
+    matches = state["matches"]
+    keyword_lower = keyword.lower()
+
+    try:
+        # Fetch the full followers list
+        q.put({"event": "status", "message": f"Fetching followers of @{username}..."})
+        fetch_count = max_followers if max_followers else 100000
+
+        try:
+            follower_usernames = fetch_followers(username, fetch_count=max(fetch_count, 50))
+        except Exception as e:
+            q.put({"event": "error", "message": f"Failed to fetch followers: {e}"})
+            q.put({"event": "complete", "stats": {"matched": 0, "scanned": 0, "errors": 1}})
+            return
+
+        if max_followers and len(follower_usernames) > max_followers:
+            follower_usernames = follower_usernames[:max_followers]
+
+        total = len(follower_usernames)
+        q.put({"event": "info", "message": f"Fetched {total} followers — scanning bios for \"{keyword}\""})
+
+        if total == 0:
+            q.put({"event": "complete", "stats": {"matched": 0, "scanned": 0, "errors": 0}})
+            return
+
+        q.put({"event": "scan_started", "total": total})
+        stats = {"matched": 0, "scanned": 0, "errors": 0}
+
+        BATCH_SIZE = 50
+
+        for batch_start in range(0, total, BATCH_SIZE):
+            if stop_event.is_set():
+                q.put({"event": "info", "message": "Scan stopped by user"})
+                break
+
+            batch = follower_usernames[batch_start:batch_start + BATCH_SIZE]
+            q.put({"event": "status", "message": f"Scraping {len(batch)} profiles..."})
+
+            try:
+                scraped = scrape_profiles_batch(batch)
+            except Exception as e:
+                q.put({"event": "error", "message": f"Batch scrape failed: {e}"})
+                stats["errors"] += len(batch)
+                stats["scanned"] += len(batch)
+                q.put({"event": "progress", "current": stats["scanned"], "total": total, "stats": dict(stats)})
+                continue
+
+            for follower in batch:
+                stats["scanned"] += 1
+                entry = scraped.get(follower.lower())
+                if entry is None:
+                    stats["errors"] += 1
+                    continue
+
+                profile_data, raw = entry
+                bio = profile_data.get("bio") or ""
+                if keyword_lower in bio.lower():
+                    resolved = profile_data.get("username") or follower
+                    match = {
+                        "username": resolved,
+                        "name": profile_data.get("name"),
+                        "bio": bio,
+                        "followers": profile_data.get("followers"),
+                        "following": profile_data.get("following"),
+                        "is_private": profile_data.get("is_private"),
+                        "profile_url": f"https://www.instagram.com/{resolved}",
+                        "profile_image_url": get_instagram_pic_url(raw),
+                    }
+                    matches.append(match)
+                    stats["matched"] += 1
+                    q.put({"event": "match", **match})
+
+            q.put({"event": "progress", "current": stats["scanned"], "total": total, "stats": dict(stats)})
+
+        q.put({"event": "complete", "stats": dict(stats)})
+
+    except Exception as e:
+        q.put({"event": "error", "message": f"Scan failed: {e}"})
+        q.put({"event": "complete", "stats": {"matched": len(matches), "scanned": 0, "errors": 1}})
+    finally:
+        # Keep results around for a while so the page can re-fetch them, then clean up.
+        def cleanup():
+            time.sleep(600)
+            active_keyword_scans.pop(scan_id, None)
+        threading.Thread(target=cleanup, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# GET /api/keyword-scan/{scan_id}/stream  —  SSE stream
+# ---------------------------------------------------------------------------
+
+@app.get("/api/keyword-scan/{scan_id}/stream")
+async def keyword_scan_stream(scan_id: str):
+    if scan_id not in active_keyword_scans:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    q = active_keyword_scans[scan_id]["queue"]
+
+    async def event_generator():
+        import json
+        while True:
+            try:
+                event = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: q.get(timeout=1)
+                )
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("event") == "complete":
+                    break
+            except queue.Empty:
+                yield ": keepalive\n\n"
+                scan = active_keyword_scans.get(scan_id)
+                if scan and not scan["thread"].is_alive() and q.empty():
+                    break
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/keyword-scan/{scan_id}/stop  —  Cancel a keyword scan
+# ---------------------------------------------------------------------------
+
+@app.post("/api/keyword-scan/{scan_id}/stop")
+def stop_keyword_scan(scan_id: str):
+    if scan_id not in active_keyword_scans:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    active_keyword_scans[scan_id]["stop"].set()
+    return {"status": "stopping"}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/keyword-scan/{scan_id}/results  —  Fetch collected matches
+# ---------------------------------------------------------------------------
+
+@app.get("/api/keyword-scan/{scan_id}/results")
+def keyword_scan_results(scan_id: str):
+    scan = active_keyword_scans.get(scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found or expired")
+    return {
+        "keyword": scan["keyword"],
+        "username": scan["username"],
+        "matches": list(scan["matches"]),
+    }
 
 
 # ---------------------------------------------------------------------------

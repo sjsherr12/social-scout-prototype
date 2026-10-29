@@ -39,6 +39,23 @@ export interface ScanRequest {
   location_slug?: string;
 }
 
+export interface KeywordScanRequest {
+  username: string;
+  keyword: string;
+  max_followers?: number;
+}
+
+export interface KeywordMatch {
+  username: string;
+  name?: string | null;
+  bio?: string | null;
+  followers?: number | null;
+  following?: number | null;
+  is_private?: boolean;
+  profile_url: string;
+  profile_image_url?: string | null;
+}
+
 export interface ProfilesResponse {
   data: Profile[];
   total: number;
@@ -74,6 +91,25 @@ export async function startScan(req: ScanRequest): Promise<{ scan_id: string; us
 
 export async function stopScan(scanId: string): Promise<void> {
   await fetch(`/api/scan/${scanId}/stop`, { method: "POST" });
+}
+
+export async function startKeywordScan(
+  req: KeywordScanRequest,
+): Promise<{ scan_id: string; username: string; keyword: string }> {
+  const res = await fetch("/api/keyword-scan", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Keyword scan start failed");
+  }
+  return res.json();
+}
+
+export async function stopKeywordScan(scanId: string): Promise<void> {
+  await fetch(`/api/keyword-scan/${scanId}/stop`, { method: "POST" });
 }
 
 export async function fetchProfiles(params: {

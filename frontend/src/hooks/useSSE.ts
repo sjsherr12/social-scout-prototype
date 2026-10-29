@@ -9,11 +9,25 @@ export interface ScanEvent {
   status?: string;
   reason?: string;
   step?: string;
-  stats?: { qualified: number; disqualified: number; errors: number };
+  stats?: {
+    qualified?: number;
+    disqualified?: number;
+    errors?: number;
+    matched?: number;
+    scanned?: number;
+  };
   data?: Record<string, unknown>;
+  // keyword-scan "match" event fields
+  name?: string | null;
+  bio?: string | null;
+  followers?: number | null;
+  following?: number | null;
+  is_private?: boolean;
+  profile_url?: string;
+  profile_image_url?: string | null;
 }
 
-export function useSSE(scanId: string | null) {
+export function useSSE(scanId: string | null, basePath: string = "/api/scan") {
   const [events, setEvents] = useState<ScanEvent[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [isComplete, setIsComplete] = useState(false);
@@ -47,7 +61,7 @@ export function useSSE(scanId: string | null) {
 
     const connect = async () => {
       try {
-        const response = await fetch(`/api/scan/${scanId}/stream`, {
+        const response = await fetch(`${basePath}/${scanId}/stream`, {
           signal: abortController.signal,
         });
 
@@ -104,7 +118,7 @@ export function useSSE(scanId: string | null) {
 
     connect();
     return () => disconnect();
-  }, [scanId, disconnect]);
+  }, [scanId, basePath, disconnect]);
 
   return { events, isConnected, isComplete, latestStats, progress, disconnect, reset };
 }

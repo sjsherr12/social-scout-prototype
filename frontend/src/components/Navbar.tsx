@@ -1,9 +1,10 @@
 import { NavLink } from "react-router-dom";
-import { Search, Users, Database } from "lucide-react";
+import { Search, Users, Tag, Database } from "lucide-react";
 
 const links = [
   { to: "/", label: "Scrape Profile", icon: Search },
   { to: "/scan", label: "Scan Followers", icon: Users },
+  { to: "/keyword", label: "Keyword Scan", icon: Tag },
   { to: "/database", label: "Database", icon: Database },
 ];
 
